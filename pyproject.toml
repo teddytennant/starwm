@@ -1,0 +1,10 @@
+[project]
+name = "starwm"
+version = "0.1.0"
+description = "Attention routing with stop-gradient barriers for a self-supervised world-model latent."
+requires-python = ">=3.10"
+dependencies = ["jax", "optax"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
