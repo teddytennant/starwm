@@ -1,4 +1,4 @@
-"""Five CPU steps on one synthetic episode. Prints losses and attention."""
+"""Twenty CPU steps on synthetic frames. Prints losses and a spatial attention peak."""
 
 import os
 
@@ -8,32 +8,40 @@ import jax
 import optax
 
 from starwm.losses import init_params, train_step
-from starwm.routing import route
-from starwm.synthetic import downsample_video, encode, make_episode
+from starwm.routing import H, W, attention
+from starwm.synthetic import encode, make_batch
 
 
 def main():
-    video, actions = make_episode(0)
-    batch = {
-        "video": video[None, ...],
-        "actions": actions[None, ...],
-        "target": downsample_video(video[None, ...]),
-    }
+    batch = make_batch(0, batch=4)
     params = init_params(jax.random.PRNGKey(0))
     optimizer = optax.adam(1e-3)
     opt_state = optimizer.init(params)
-    for step in range(5):
-        params, opt_state, aux = train_step(params, opt_state, batch, optimizer)
+    key = jax.random.PRNGKey(1)
+    last = None
+    for step in range(20):
+        params, opt_state, aux = train_step(
+            params, opt_state, batch, optimizer, jax.random.fold_in(key, step)
+        )
+        last = aux
         print(
             f"step {step} total={float(aux['total']):.6f} "
             f"recon={float(aux['recon']):.6f} "
             f"inverse={float(aux['inverse']):.6f} "
-            f"contrastive={float(aux['contrastive']):.6f}"
+            f"contrastive={float(aux['contrastive']):.6f} "
+            f"kl={float(aux['kl']):.6f}"
         )
-    z = encode(params["encoder"], batch["video"])
-    _z_att, alpha = route(params["router"], z)
-    weights = [f"{float(w):.4f}" for w in alpha[0]]
-    print("attention", " ".join(weights))
+    features = encode(params["encoder"], batch["video"])
+    attn = attention(params["router"], features)
+    peak = int(jnp_argmax(attn[0, 0, 0]))
+    print(f"query0 frame0 peak token {peak} of {H * W} (cell {peak // W},{peak % W})")
+    print(f"final total {float(last['total']):.6f}")
+
+
+def jnp_argmax(x):
+    import jax.numpy as jnp
+
+    return jnp.argmax(x)
 
 
 if __name__ == "__main__":

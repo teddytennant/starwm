@@ -1,11 +1,14 @@
-"""Self-supervised losses with stop-gradient barriers.
+"""Self-supervised losses with the paper's stop-gradient split.
 
-Reconstruction reads stop_gradient(z_att), so it does not train the router.
-Dynamics (inverse dynamics + contrastive) reads z_att and
-stop_gradient(decoder output), so it does not train the content decoder.
+Inverse dynamics and the contrastive loss read flatten(At Ft), so they train
+Q, WQ, and WK. Reconstruction composes the two streams with A_bar = sg(At),
+so it does not train those parameters. The pixel decoder and the residual
+bottleneck are not inputs to the dynamics losses.
 
-Do not replace this with attention(stop_gradient(z)). That barrier is the
-wrong split: it would still let reconstruction gradients into the router.
+Eq. 7 is the logistic form in the paper, not a full-batch InfoNCE:
+
+    -log sigmoid( phi(e_t) · phi(e_{t+1}) / tau )
+    -log sigmoid( -phi(e_t) · phi(e_neg) / tau )
 """
 
 from __future__ import annotations
@@ -16,74 +19,116 @@ import optax
 
 from starwm.routing import (
     A,
-    D,
-    content_decode,
-    decoder_input,
-    init_decoder,
-    init_inverse,
-    init_predict,
+    C,
+    H,
+    L,
+    N,
+    W,
+    attention,
+    compose,
+    coverage_mask,
+    dynamics_tokens,
+    foreground,
     init_router,
-    inverse_logits,
-    predict_next,
-    route_details,
-    temporal_latents,
+    keys_and_values,
+    pooled_content,
 )
 from starwm.synthetic import encode, init_encoder
 
 TEMPERATURE = 0.1
-
-# Fixed mixes so dynamics depends on the decoder output in a way softmax
-# cannot cancel. Not parameters. Scale is small so training stays finite.
-_MIX_A = jnp.sin(
-    jnp.arange(64)[:, None] * 0.7 + jnp.arange(A)[None, :] * 1.3
-).astype(jnp.float32) * 0.05
-_MIX_D = jnp.sin(
-    jnp.arange(64)[:, None] * 0.3 + jnp.arange(D)[None, :] * 0.9
-).astype(jnp.float32) * 0.05
+BETA_KL = 1e-3
+BOTTLENECK = 4
 
 
-def init_params(key, d: int = D, a: int = A):
-    k_enc, k_router, k_dec, k_inv, k_pred = jax.random.split(key, 5)
+def init_fg(key, c: int = C):
+    k_w, k_b = jax.random.split(key)
     return {
-        "encoder": init_encoder(k_enc, d),
-        "router": init_router(k_router, d),
-        "decoder": init_decoder(k_dec, d),
-        "inverse": init_inverse(k_inv, d, a),
-        "predict": init_predict(k_pred, d, a),
+        "W": jax.random.normal(k_w, (c + 2, c)) * 0.1,
+        "b": jax.random.normal(k_b, (c,)) * 0.1,
     }
 
 
+def init_bg(key, c: int = C, width: int = BOTTLENECK):
+    keys = jax.random.split(key, 6)
+    return {
+        "W_mu": jax.random.normal(keys[0], (c, width)) * 0.1,
+        "b_mu": jax.random.normal(keys[1], (width,)) * 0.1,
+        "W_lv": jax.random.normal(keys[2], (c, width)) * 0.1,
+        "b_lv": jax.random.normal(keys[3], (width,)) * 0.1,
+        "W_out": jax.random.normal(keys[4], (width, c)) * 0.1,
+        "b_out": jax.random.normal(keys[5], (c,)) * 0.1,
+    }
+
+
+def init_pixel(key, c: int = C):
+    """Non-overlapping stride-4 patch decoder: each token maps to a 4x4 patch."""
+    k_w, k_b = jax.random.split(key)
+    return {
+        "W": jax.random.normal(k_w, (c, 16)) * 0.1,
+        "b": jax.random.normal(k_b, (16,)) * 0.1,
+    }
+
+
+def init_inverse(key, c: int = C, n: int = N, a: int = A):
+    k_w, k_b = jax.random.split(key)
+    width = n * c
+    return {
+        "W": jax.random.normal(k_w, (2 * width, a)) * 0.1,
+        "b": jax.random.normal(k_b, (a,)) * 0.1,
+    }
+
+
+def init_contrast(key, c: int = C, n: int = N):
+    k_w, k_b = jax.random.split(key)
+    width = n * c
+    return {
+        "W": jax.random.normal(k_w, (width, width)) * 0.1,
+        "b": jax.random.normal(k_b, (width,)) * 0.1,
+    }
+
+
+def init_params(key):
+    keys = jax.random.split(key, 6)
+    return {
+        "encoder": init_encoder(keys[0]),
+        "router": init_router(keys[1]),
+        "fg": init_fg(keys[2]),
+        "bg": init_bg(keys[3]),
+        "pixel": init_pixel(keys[4]),
+        "inverse": init_inverse(keys[5]),
+        "contrast": init_contrast(keys[0]),
+    }
+
+
+def project_entity(params, edyn):
+    """phi_fg: dynamics tokens (..., N, C+2) -> entity features (..., N, C)."""
+    return jnp.einsum("...nd,dc->...nc", edyn, params["W"]) + params["b"]
+
+
+def residual_stream(params, features, key):
+    """Gaussian bottleneck on Ft. Returns F_bg (..., L, C) and a mean KL."""
+    mu = jnp.einsum("...lc,cw->...lw", features, params["W_mu"]) + params["b_mu"]
+    logvar = jnp.einsum("...lc,cw->...lw", features, params["W_lv"]) + params["b_lv"]
+    logvar = jnp.clip(logvar, -8.0, 8.0)
+    eps = jax.random.normal(key, mu.shape)
+    z = mu + eps * jnp.exp(0.5 * logvar)
+    bg = jnp.einsum("...lw,wc->...lc", z, params["W_out"]) + params["b_out"]
+    kl = -0.5 * jnp.mean(1.0 + logvar - jnp.square(mu) - jnp.exp(logvar))
+    return bg, kl
+
+
+def pixel_decode(params, features):
+    """Stitch non-overlapping 4x4 patches into (..., 16, 16, 1)."""
+    patches = jnp.einsum("...lc,cp->...lp", features, params["W"]) + params["b"]
+    lead = patches.shape[:-2]
+    patches = patches.reshape(lead + (H, W, 4, 4))
+    image = jnp.transpose(patches, (*range(len(lead)), len(lead), len(lead) + 2, len(lead) + 1, len(lead) + 3))
+    image = image.reshape(lead + (H * 4, W * 4, 1))
+    return image
+
+
 def reconstruction_loss(pred, target):
-    """MSE between content-decoder output and a provided target patch."""
-    return jnp.mean((pred - target) ** 2)
-
-
-def _l2_normalize(x, eps: float = 1e-8):
-    norm = jnp.linalg.norm(x, axis=-1, keepdims=True)
-    return x / jnp.maximum(norm, eps)
-
-
-def info_nce(pred, target, temperature: float = TEMPERATURE):
-    """InfoNCE with other batch elements as negatives.
-
-    pred and target are (B, D). Temperature is 0.1. Identical matched pairs
-    that differ across the batch score lower than mismatched pairs.
-    """
-    pred_n = _l2_normalize(pred)
-    target_n = _l2_normalize(target)
-    logits = (pred_n @ target_n.T) / temperature
-    labels = jax.nn.one_hot(jnp.arange(pred.shape[0]), pred.shape[0])
-    log_probs = jax.nn.log_softmax(logits, axis=-1)
-    return -jnp.mean(jnp.sum(labels * log_probs, axis=-1))
-
-
-def info_nce_sequence(pred, target, temperature: float = TEMPERATURE):
-    """InfoNCE at each timestep. Negatives are other batch elements, not other times."""
-
-    def one_t(pred_t, target_t):
-        return info_nce(pred_t, target_t, temperature)
-
-    return jnp.mean(jax.vmap(one_t, in_axes=1)(pred, target))
+    return jnp.mean(jnp.square(pred - target))
 
 
 def cross_entropy(logits, target_onehot):
@@ -91,87 +136,88 @@ def cross_entropy(logits, target_onehot):
     return -jnp.mean(jnp.sum(target_onehot * log_probs, axis=-1))
 
 
-def inverse_dynamics_loss(params, z_t, z_tp1, actions):
-    """Cross-entropy inverse dynamics from (z_att_t, z_att_{t+1}) to action_t."""
-    logits = inverse_logits(params, z_t, z_tp1)
-    return cross_entropy(logits, actions)
+def inverse_logits(params, e_t, e_tp1):
+    x = jnp.concatenate([e_t, e_tp1], axis=-1)
+    return jnp.einsum("...d,da->...a", x, params["W"]) + params["b"]
 
 
-def stopped_decoder_flat(decoded):
-    """Dynamics reads stop_gradient(decoder output).
+def inverse_dynamics_loss(params, e_t, e_tp1, actions):
+    """Cross-entropy of phi_inv(eattn_t, eattn_{t+1}) against action_t."""
+    return cross_entropy(inverse_logits(params, e_t, e_tp1), actions)
 
-    Removing this stop_gradient lets inverse dynamics and contrastive train
-    the content decoder.
+
+def contrast_phi(params, eattn):
+    return jnp.einsum("...d,dh->...h", eattn, params["W"]) + params["b"]
+
+
+def logistic_contrastive(phi_t, phi_tp1, phi_neg, temperature: float = TEMPERATURE):
+    """Eq. 7. phi_* are (..., D)."""
+    pos = jnp.sum(phi_t * phi_tp1, axis=-1) / temperature
+    neg = jnp.sum(phi_t * phi_neg, axis=-1) / temperature
+    return jnp.mean(-jax.nn.log_sigmoid(pos) - jax.nn.log_sigmoid(-neg))
+
+
+def compose_features(router, fg_params, features):
+    """Stopped attention, foreground broadcast, coverage mask. No residual yet."""
+    attn = attention(router, features)
+    attn_bar = jax.lax.stop_gradient(attn)
+    _keys, values = keys_and_values(features)
+    edyn = dynamics_tokens(attn_bar, values)
+    entity = project_entity(fg_params, edyn)
+    fg = foreground(attn_bar, entity)
+    mask = coverage_mask(attn_bar)
+    return attn, fg, mask
+
+
+def compute_losses(params, video, actions, key):
+    """Encode frames, route, and apply the barred losses.
+
+    video: (B, T, 16, 16, 1). actions: (B, T, A).
     """
-    return jax.lax.stop_gradient(decoded).reshape(decoded.shape[0], -1)
+    features = encode(params["encoder"], video)
+    attn = attention(params["router"], features)
+    eattn = pooled_content(attn, features)
+    attn_bar = jax.lax.stop_gradient(attn)
+    _keys, values = keys_and_values(features)
+    edyn = dynamics_tokens(attn_bar, values)
+    entity = project_entity(params["fg"], edyn)
+    fg = foreground(attn_bar, entity)
+    mask = coverage_mask(attn_bar)
+    bg, kl = residual_stream(params["bg"], features, key)
+    composed = compose(fg, bg, mask)
+    decoded = pixel_decode(params["pixel"], composed)
+    recon = reconstruction_loss(decoded, video)
 
-
-def apply_decoder_barrier(decoded, inv_logits, pred):
-    """Add a stopped decoder feature so the barrier is load-bearing.
-
-    The mix differs across action and latent coordinates, so cross-entropy is
-    not invariant to it. With the stop, decoder grads are zero. Without it,
-    they are not.
-    """
-    flat = stopped_decoder_flat(decoded)
-    action_bias = flat @ _MIX_A
-    latent_bias = flat @ _MIX_D
-    if inv_logits.ndim == 3:
-        inv_logits = inv_logits + action_bias[:, None, :]
-    else:
-        inv_logits = inv_logits + action_bias
-    if pred.ndim == 3:
-        pred = pred + latent_bias[:, None, :]
-    else:
-        pred = pred + latent_bias
-    return inv_logits, pred
-
-
-def losses_from_latents(params, z, actions, target):
-    """Recon + inverse + contrastive on a latent sequence z (B, T, D).
-
-    Router parameters produce alpha and z_att from z (no stop on z).
-    The content decoder reads stop_gradient(z_att).
-    Dynamics reads z_att and stop_gradient(decoder output).
-    """
-    z_att, alpha, values = route_details(params["router"], z)
-    decoded = content_decode(params["decoder"], decoder_input(z_att, z))
-    recon = reconstruction_loss(decoded, target)
-
-    h = temporal_latents(z_att, values)
-    z_t = h[:, :-1]
-    z_tp1 = h[:, 1:]
+    e_t = eattn[:, :-1]
+    e_tp1 = eattn[:, 1:]
     action_t = actions[:, :-1]
-    inv_logits = inverse_logits(params["inverse"], z_t, z_tp1)
-    pred = predict_next(params["predict"], z_t, action_t)
-    inv_logits, pred = apply_decoder_barrier(decoded, inv_logits, pred)
-    inverse = cross_entropy(inv_logits, action_t)
-    contrastive = info_nce_sequence(pred, z_tp1)
-    total = recon + inverse + contrastive
+    inverse = inverse_dynamics_loss(params["inverse"], e_t, e_tp1, action_t)
+
+    phi = contrast_phi(params["contrast"], eattn)
+    phi_t = phi[:, :-1]
+    phi_tp1 = phi[:, 1:]
+    # A negative from another batch row. Roll is a no-op only when B == 1.
+    phi_neg = jnp.roll(phi_tp1, 1, axis=0)
+    contrastive = logistic_contrastive(phi_t, phi_tp1, phi_neg)
+
+    total = recon + inverse + contrastive + BETA_KL * kl
     return {
         "total": total,
         "recon": recon,
         "inverse": inverse,
         "contrastive": contrastive,
-        "alpha": alpha,
+        "kl": kl,
+        "attn": attn,
+        "mask": mask,
+        "composed": composed,
     }
 
 
-def compute_losses(params, video, actions, target):
-    """Encode frames, then apply the barred losses.
-
-    The encoder is a small linear conv. Reconstruction trains it through the
-    straight-through residual in decoder_input, not through the router.
-    """
-    z = encode(params["encoder"], video)
-    return losses_from_latents(params, z, actions, target)
-
-
-def train_step(params, opt_state, batch, optimizer):
-    """One gradient step on recon + inverse + contrastive. Returns finite aux."""
+def train_step(params, opt_state, batch, optimizer, key):
+    """One gradient step. key draws the residual bottleneck noise."""
 
     def loss_fn(p):
-        out = compute_losses(p, batch["video"], batch["actions"], batch["target"])
+        out = compute_losses(p, batch["video"], batch["actions"], key)
         return out["total"], out
 
     (_total, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)

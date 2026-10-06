@@ -1,15 +1,21 @@
-"""Cross-attention router and dual-stream heads.
+"""Spatial cross-attention router from StarWM section 3.
 
-Latent sequence z has shape (B, T, D). A learned query q in R^D scores each
-timestep, and the routed latent is the attention-weighted value projection:
+Features Ft have shape (..., L, C) with L = H*W. Keys add a fixed 2D
+sinusoidal positional encoding, values append normalized coordinates:
 
-    scores_t = (W_q q) · (W_k z_t) / sqrt(D)
-    alpha = softmax(scores) over t
-    z_att = sum_t alpha_t * (W_v z_t)
+    Kt = Ft + Epos
+    Vt = [Ft ; Ecoord]
 
-The content stream decodes a patch from stop_gradient(z_att). The dynamics
-stream keeps per-step value latents so inverse dynamics and next-latent
-prediction can read z_att_t. This is not a policy, actor, or critic.
+N learnable queries attend over space (eq. 5):
+
+    At = softmax( (Q WQ) (Kt WK)^T / sqrt(C) )   over the L tokens
+
+Coordinate-free pooled content is flatten(At Ft). The dynamics stream and
+the dual-stream decoder read stop_gradient(At), so reconstruction does not
+train Q, WQ, or WK. Inverse dynamics and the contrastive loss read At Ft,
+so those losses do train the router.
+
+Not multi-head. Not an RSSM. Not a policy.
 """
 
 from __future__ import annotations
@@ -17,112 +23,108 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 
-D = 16
+H = 4
+W = 4
+L = H * W
+C = 8
+N = 2
 T = 8
 A = 4
+# Alias kept so older imports that meant "latent width" still resolve.
+D = C
 
 
-def init_router(key, d: int = D):
-    kq, k_wq, k_wk, k_wv = jax.random.split(key, 4)
+def positional_encoding(h: int = H, w: int = W, c: int = C):
+    """2D sinusoidal encoding, shape (L, C). Even channels are y, odd are x."""
+    if c % 2 != 0:
+        raise ValueError("C must be even so y and x each get c/2 channels")
+    half = c // 2
+    ys = jnp.arange(h, dtype=jnp.float32)
+    xs = jnp.arange(w, dtype=jnp.float32)
+    yy, xx = jnp.meshgrid(ys, xs, indexing="ij")
+    yy = yy.reshape(-1)
+    xx = xx.reshape(-1)
+    freq_dim = half // 2
+    denom = jnp.power(10000.0, jnp.arange(freq_dim, dtype=jnp.float32) / freq_dim)
+    y_ang = yy[:, None] / denom[None, :]
+    x_ang = xx[:, None] / denom[None, :]
+    y_pe = jnp.concatenate([jnp.sin(y_ang), jnp.cos(y_ang)], axis=-1)
+    x_pe = jnp.concatenate([jnp.sin(x_ang), jnp.cos(x_ang)], axis=-1)
+    pe = jnp.stack([y_pe, x_pe], axis=-1).reshape(h * w, c)
+    return pe
+
+
+def spatial_coords(h: int = H, w: int = W):
+    """Normalized (y, x) in [0, 1], shape (L, 2)."""
+    ys = jnp.linspace(0.0, 1.0, h, dtype=jnp.float32)
+    xs = jnp.linspace(0.0, 1.0, w, dtype=jnp.float32)
+    yy, xx = jnp.meshgrid(ys, xs, indexing="ij")
+    return jnp.stack([yy, xx], axis=-1).reshape(h * w, 2)
+
+
+def init_router(key, c: int = C, n: int = N):
+    kq, kwq, kwk = jax.random.split(key, 3)
     scale = 0.2
     return {
-        "q": jax.random.normal(kq, (d,)) * scale,
-        "W_q": jax.random.normal(k_wq, (d, d)) * scale,
-        "W_k": jax.random.normal(k_wk, (d, d)) * scale,
-        "W_v": jax.random.normal(k_wv, (d, d)) * scale,
+        "Q": jax.random.normal(kq, (n, c)) * scale,
+        "WQ": jax.random.normal(kwq, (c, c)) * scale,
+        "WK": jax.random.normal(kwk, (c, c)) * scale,
     }
 
 
-def init_decoder(key, d: int = D, patch: int = 64):
-    k_w, k_b = jax.random.split(key)
-    return {
-        "W": jax.random.normal(k_w, (d, patch)) * 0.1,
-        "b": jax.random.normal(k_b, (patch,)) * 0.1,
-    }
+def keys_and_values(features):
+    """Kt = Ft + Epos, Vt = [Ft; Ecoord]. features is (..., L, C)."""
+    epos = positional_encoding(H, W, features.shape[-1])
+    ecoord = spatial_coords(H, W)
+    keys = features + epos
+    values = jnp.concatenate([features, jnp.broadcast_to(ecoord, features.shape[:-1] + (2,))], axis=-1)
+    return keys, values
 
 
-def init_predict(key, d: int = D, a: int = A):
-    k_w, k_b = jax.random.split(key)
-    return {
-        "W": jax.random.normal(k_w, (d + a, d)) * 0.1,
-        "b": jax.random.normal(k_b, (d,)) * 0.1,
-    }
+def attention(params, features):
+    """Eq. 5. Returns At with shape (..., N, L), softmax over space."""
+    keys, _values = keys_and_values(features)
+    q_proj = jnp.einsum("nc,cd->nd", params["Q"], params["WQ"])
+    k_proj = jnp.einsum("...lc,cd->...ld", keys, params["WK"])
+    scale = jnp.sqrt(jnp.asarray(features.shape[-1], dtype=features.dtype))
+    logits = jnp.einsum("nd,...ld->...nl", q_proj, k_proj) / scale
+    return jax.nn.softmax(logits, axis=-1)
 
 
-def init_inverse(key, d: int = D, a: int = A):
-    k_w, k_b = jax.random.split(key)
-    return {
-        "W": jax.random.normal(k_w, (2 * d, a)) * 0.1,
-        "b": jax.random.normal(k_b, (a,)) * 0.1,
-    }
+def pooled_content(attn, features):
+    """flatten(At Ft). Coordinates are not in this vector. Shape (..., N*C)."""
+    pooled = jnp.einsum("...nl,...lc->...nc", attn, features)
+    n = pooled.shape[-2]
+    c = pooled.shape[-1]
+    return pooled.reshape(pooled.shape[:-2] + (n * c,))
 
 
-def route(params, z):
-    """Cross-attend over time with a learned query.
+def dynamics_tokens(attn_bar, values):
+    """edyn = A_bar Vt. Shape (..., N, C+2)."""
+    return jnp.einsum("...nl,...ld->...nd", attn_bar, values)
 
-    Args:
-        params: q (D,), W_q, W_k, W_v each (D, D).
-        z: latent sequence (B, T, D).
 
-    Returns:
-        z_att: (B, D) attention-pooled values.
-        alpha: (B, T) softmax weights, summing to 1 over time.
+def coverage_mask(attn_bar):
+    """Mt = clamp(sum over queries of A_bar, 0, 1). Shape (..., L)."""
+    return jnp.clip(jnp.sum(attn_bar, axis=-2), 0.0, 1.0)
+
+
+def foreground(attn_bar, entity):
+    """F_fg = A_bar^T e_hat. attn (..., N, L), entity (..., N, C) -> (..., L, C)."""
+    return jnp.einsum("...nl,...nc->...lc", attn_bar, entity)
+
+
+def compose(fg, bg, mask):
+    """Eq. 8. F_hat = F_fg * M + F_bg * (1 - M)."""
+    m = mask[..., None]
+    return fg * m + bg * (1.0 - m)
+
+
+def route(params, features):
+    """Attention and coordinate-free pooled content. No stop-gradient here.
+
+    features: (..., L, C)
+    returns attn (..., N, L), eattn (..., N*C)
     """
-    z_att, alpha, _values = route_details(params, z)
-    return z_att, alpha
-
-
-def route_details(params, z):
-    """Same as route, plus per-timestep value projections W_v z_t."""
-    d = z.shape[-1]
-    q_proj = params["W_q"] @ params["q"]
-    keys = jnp.einsum("ij,btj->bti", params["W_k"], z)
-    values = jnp.einsum("ij,btj->bti", params["W_v"], z)
-    scale = jnp.sqrt(jnp.asarray(d, dtype=z.dtype))
-    scores = jnp.einsum("i,bti->bt", q_proj, keys) / scale
-    alpha = jax.nn.softmax(scores, axis=-1)
-    z_att = jnp.einsum("bt,bti->bi", alpha, values)
-    return z_att, alpha, values
-
-
-def temporal_latents(z_att, values):
-    """Per-step dynamics latents that still depend on pooled z_att.
-
-    z_att_t = W_v z_t + z_att. Inverse dynamics and predict_next read these.
-    Adding the pooled vector makes alpha, W_q, W_k, and q visible to the
-    dynamics loss, not only W_v.
-    """
-    return values + z_att[:, None, :]
-
-
-def decoder_input(z_att, z):
-    """Input to the content decoder.
-
-    The decoder reads stop_gradient(z_att), so reconstruction does not train
-    the router. A straight-through residual from the mean latent lets the
-    same reconstruction loss train the encoder. Forward value equals z_att
-    plus a zero residual.
-    """
-    pooled = jnp.mean(z, axis=1)
-    return jax.lax.stop_gradient(z_att) + pooled - jax.lax.stop_gradient(pooled)
-
-
-def content_decode(params, z_att):
-    """Map a routed latent (B, D) to a patch (B, 8, 8, 1)."""
-    flat = z_att @ params["W"] + params["b"]
-    return flat.reshape(z_att.shape[0], 8, 8, 1)
-
-
-def predict_next(params, z_att_t, action_t):
-    """Latent prediction head. Not a pixel decoder.
-
-    z_att_t: (..., D), action_t: (..., A) -> z_{t+1} hat (..., D).
-    """
-    x = jnp.concatenate([z_att_t, action_t], axis=-1)
-    return x @ params["W"] + params["b"]
-
-
-def inverse_logits(params, z_t, z_tp1):
-    """Predict action logits from a consecutive latent pair."""
-    x = jnp.concatenate([z_t, z_tp1], axis=-1)
-    return x @ params["W"] + params["b"]
+    attn = attention(params, features)
+    return attn, pooled_content(attn, features)
